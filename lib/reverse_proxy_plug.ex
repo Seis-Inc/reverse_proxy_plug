@@ -281,7 +281,6 @@ defmodule ReverseProxyPlug do
     headers =
       conn.req_headers
       |> normalize_headers
-      |> add_x_fwd_for_header(conn)
 
     proxy_req_host =
       if options[:preserve_host_header] do
