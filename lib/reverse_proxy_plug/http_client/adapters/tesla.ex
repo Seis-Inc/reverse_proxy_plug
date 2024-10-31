@@ -3,7 +3,10 @@ if Code.ensure_loaded?(Tesla) do
     @moduledoc """
     Tesla adapter for the `ReverseProxyPlug.HTTPClient` behaviour
 
-    Only synchronous responses are supported.
+    Buffer response mode is supported for all Tesla versions.
+
+    Stream response mode is supported for Tesla 1.9.0 and up when using
+    the Finch adapter.
 
     ## Options
 
@@ -14,6 +17,9 @@ if Code.ensure_loaded?(Tesla) do
     alias ReverseProxyPlug.HTTPClient
 
     @behaviour HTTPClient
+
+    @minimum_tesla_version_for_stream Version.parse!("1.9.0")
+    @tesla_version Application.spec(:tesla, :vsn) |> to_string() |> Version.parse!()
 
     @impl HTTPClient
     def request(%HTTPClient.Request{options: options} = request) do
@@ -48,6 +54,26 @@ if Code.ensure_loaded?(Tesla) do
 
         {:error, error} ->
           {:error, %HTTPClient.Error{reason: error}}
+      end
+    end
+
+    if Version.compare(@tesla_version, @minimum_tesla_version_for_stream) in [:gt, :eq] do
+      @impl HTTPClient
+      def request_stream(%HTTPClient.Request{options: options} = req) do
+        case request(%{req | options: Keyword.merge(options, adapter: [response: :stream])}) do
+          {:ok, %HTTPClient.Response{status_code: status_code, headers: headers, body: body}} ->
+            {:ok,
+             Stream.concat(
+               [
+                 {:status, status_code},
+                 {:headers, headers}
+               ],
+               Stream.map(body, &{:chunk, &1})
+             )}
+
+          {:error, _} = error ->
+            error
+        end
       end
     end
   end

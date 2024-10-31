@@ -1,7 +1,7 @@
-defmodule ReverseProxyPlug.HTTPClient.Adapters.HTTPoisonTest do
+defmodule ReverseProxyPlug.HTTPClient.Adapters.ReqTest do
   use ExUnit.Case, async: false
 
-  alias ReverseProxyPlug.HTTPClient.Adapters.HTTPoison, as: HTTPoisonClient
+  alias ReverseProxyPlug.HTTPClient.Adapters.Req, as: ReqClient
 
   alias ReverseProxyPlug.HTTPClient.{
     Error,
@@ -10,6 +10,8 @@ defmodule ReverseProxyPlug.HTTPClient.Adapters.HTTPoisonTest do
   }
 
   setup do
+    start_supervised!({Finch, name: FinchTest})
+
     %{bypass: Bypass.open(port: 8000)}
   end
 
@@ -20,6 +22,7 @@ defmodule ReverseProxyPlug.HTTPClient.Adapters.HTTPoisonTest do
 
         req = %Request{
           method: unquote(method),
+          options: [finch: FinchTest],
           url: "http://localhost:8000#{path}"
         }
 
@@ -29,16 +32,17 @@ defmodule ReverseProxyPlug.HTTPClient.Adapters.HTTPoisonTest do
           Plug.Conn.send_resp(conn, 204, "")
         end)
 
-        assert {:ok, %Response{}} = HTTPoisonClient.request(req)
+        assert {:ok, %Response{}} = ReqClient.request(req)
       end
 
-      test "should return async responses for asynchronous request with method #{method}", %{
+      test "should return async responses for asynchronous requests with method #{method}", %{
         bypass: bypass
       } do
         path = "/my-resource"
 
         req = %Request{
           method: unquote(method),
+          options: [finch: FinchTest],
           url: "http://localhost:8000#{path}"
         }
 
@@ -48,7 +52,7 @@ defmodule ReverseProxyPlug.HTTPClient.Adapters.HTTPoisonTest do
           Plug.Conn.send_resp(conn, 204, "")
         end)
 
-        assert {:ok, stream} = HTTPoisonClient.request_stream(req)
+        assert {:ok, stream} = ReqClient.request_stream(req)
 
         assert [
                  {:status, 204},
@@ -63,40 +67,12 @@ defmodule ReverseProxyPlug.HTTPClient.Adapters.HTTPoisonTest do
 
         req = %Request{
           method: unquote(method),
+          options: [finch: FinchTest],
           url: "http://localhost:8001#{path}"
         }
 
-        assert {:error, %Error{reason: :econnrefused}} == HTTPoisonClient.request(req)
+        assert {:error, %Error{reason: :econnrefused}} == ReqClient.request(req)
       end
-    end
-
-    test "should return error when request timeout" do
-      bypass = Bypass.open(port: 8002)
-      on_exit({Bypass, bypass.pid}, fn -> :ok end)
-      recv_timeout = 50
-
-      path = "/my-timeout-path"
-
-      req = %Request{
-        method: :get,
-        url: "http://localhost:8002#{path}",
-        options: [
-          recv_timeout: recv_timeout,
-          stream_to: self()
-        ]
-      }
-
-      Bypass.expect_once(bypass, fn %Plug.Conn{} = conn ->
-        assert conn.method == req.method |> to_string() |> String.upcase()
-        assert conn.request_path == path
-
-        Process.sleep(recv_timeout + 1)
-        Plug.Conn.send_resp(conn, 204, "")
-      end)
-
-      assert {:ok, %Response{}} = HTTPoisonClient.request(req)
-
-      assert_receive %HTTPoison.Error{reason: {:closed, :timeout}}, 1_000
     end
   end
 end

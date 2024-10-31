@@ -5,28 +5,27 @@ defmodule TestReuse do
   alias ReverseProxyPlug.HTTPClient
 
   def get_buffer_responder(response_args) do
-    fn _request ->
-      {:ok, make_response(response_args)}
+    fn request ->
+      {:ok, make_response(response_args, request)}
     end
   end
 
   def get_stream_responder(response_args) do
-    %{status_code: code, headers: headers, body: body} = make_response(response_args)
+    fn request ->
+      %{status_code: code, headers: headers, body: body} = make_response(response_args, request)
 
-    fn _request ->
-      send(self(), %HTTPoison.AsyncStatus{code: code})
-      send(self(), %HTTPoison.AsyncHeaders{headers: headers})
+      body_chunks =
+        body
+        |> String.codepoints()
+        |> Enum.chunk_every(body |> String.length() |> div(3))
+        |> Enum.map(&Enum.join/1)
+        |> Enum.map(&{:chunk, &1})
 
-      body
-      |> String.codepoints()
-      |> Enum.chunk_every(body |> String.length() |> div(3))
-      |> Enum.map(&Enum.join/1)
-      |> Enum.each(fn chunk ->
-        send(self(), %HTTPoison.AsyncChunk{chunk: chunk})
-      end)
-
-      send(self(), %HTTPoison.AsyncEnd{})
-      {:ok, nil}
+      {:ok,
+       [
+         {:status, code},
+         {:headers, headers}
+       ] ++ body_chunks}
     end
   end
 
@@ -35,7 +34,8 @@ defmodule TestReuse do
       test unquote(message) <> " (stream)" do
         var!(test_reuse_opts) = %{
           opts: [response_mode: :stream] ++ unquote(@default_opts),
-          get_responder: &TestReuse.get_stream_responder/1
+          get_responder: &TestReuse.get_stream_responder/1,
+          req_function: :request_stream
         }
 
         unquote(body)
@@ -44,7 +44,8 @@ defmodule TestReuse do
       test unquote(message) <> " (buffer)" do
         var!(test_reuse_opts) = %{
           opts: [response_mode: :buffer] ++ unquote(@default_opts),
-          get_responder: &TestReuse.get_buffer_responder/1
+          get_responder: &TestReuse.get_buffer_responder/1,
+          req_function: :request
         }
 
         unquote(body)
@@ -52,11 +53,12 @@ defmodule TestReuse do
     end
   end
 
-  defp make_response(%{} = args) do
+  def make_response(%{} = args, request) do
     %HTTPClient.Response{
       status_code: args[:status_code] || 200,
       headers: args[:headers] || [],
-      body: args[:body] || "Success"
+      body: args[:body] || "Success",
+      request: request
     }
   end
 end

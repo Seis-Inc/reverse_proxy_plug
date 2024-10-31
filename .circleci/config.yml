@@ -2,7 +2,7 @@ version: 2
 jobs:
   build:
     docker:
-      - image: cimg/elixir:1.11
+      - image: cimg/elixir:1.13
         environment:
           MIX_ENV: test
     steps:
@@ -29,4 +29,6 @@ jobs:
           key: v1-build-cache-{{ .Branch }}
           paths: "_build"
 
-      - run: mix test --trace
+      - store_artifacts:
+          path: cover/excoveralls.html
+          destination: coverage.html

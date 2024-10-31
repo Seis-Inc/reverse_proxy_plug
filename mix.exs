@@ -2,19 +2,20 @@ defmodule ReverseProxyPlug.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/tallarium/reverse_proxy_plug"
-  @version "2.3.0"
+  @version "3.0.2"
 
   def project do
     [
       app: :reverse_proxy_plug,
       version: @version,
-      elixir: "~> 1.11",
+      elixir: "~> 1.13",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       aliases: aliases(),
       deps: deps(),
       docs: docs(),
       package: package(),
+      test_coverage: [tool: ExCoveralls],
       dialyzer: [plt_add_apps: [:httpoison, :tesla]]
     ]
   end
@@ -35,7 +36,8 @@ defmodule ReverseProxyPlug.MixProject do
       ci: [
         "format --check-formatted",
         "credo --strict",
-        "compile --warnings-as-errors --force"
+        "compile --warnings-as-errors --force",
+        "coveralls.html"
       ]
     ]
   end
@@ -51,12 +53,14 @@ defmodule ReverseProxyPlug.MixProject do
 
   defp deps do
     [
+      {:req, "~> 0.3.0 or ~> 0.4.0 or ~> 0.5.0", optional: true},
+      {:finch, "~> 0.18", optional: true},
+      {:excoveralls, "~> 0.18", only: :test},
       {:mix_test_watch, "~> 1.1", only: [:dev, :test], runtime: false},
       {:plug, "~> 1.6"},
-      {:cowboy, "~> 2.4"},
       {:httpoison, "~> 1.2 or ~> 2.0", optional: true},
-      {:credo, "~> 1.0", only: [:dev, :test]},
-      {:mox, "~> 1.0", only: :test, optional: true},
+      {:credo, "~> 1.0", only: [:dev, :test], runtime: false},
+      {:hammox, "~> 0.7", only: :test},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false},
       {:tesla, "~> 1.4", optional: true},
       {:bypass, "~> 2.1.0", optional: true, only: :test},

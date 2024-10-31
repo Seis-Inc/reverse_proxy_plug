@@ -38,11 +38,13 @@ defmodule ReverseProxyPlug do
     |> Keyword.put_new(:response_mode, :stream)
     |> Keyword.put_new(:stream_headers_mode, :replace)
     |> Keyword.put_new(:buffer_headers_mode, :prepend)
+    |> Keyword.put_new(:normalize_headers, &ReverseProxyPlug.downcase_headers/1)
     |> Keyword.put_new(:status_callbacks, %{})
     |> Keyword.update(:error_callback, nil, fn
       {m, f, a} -> {m, f, a}
       fun when is_function(fun) -> fun
     end)
+    |> ensure_response_mode_compatibility()
   end
 
   @spec call(Plug.Conn.t(), Keyword.t()) :: Plug.Conn.t()
@@ -57,7 +59,7 @@ defmodule ReverseProxyPlug do
       opts
       |> Keyword.merge(upstream_parts)
 
-    body = read_body(conn)
+    {body, conn} = read_body(conn)
     conn |> request(body, opts) |> response(conn, opts)
   end
 
@@ -102,31 +104,29 @@ defmodule ReverseProxyPlug do
   end
 
   def request(conn, body, opts) do
-    {method, url, headers, client_options} = prepare_request(conn, opts)
+    request = prepare_request(conn, opts, body)
 
-    opts[:client].request(%HTTPClient.Request{
-      method: method,
-      url: url,
-      body: body,
-      headers: headers,
-      options: client_options
-    })
+    if opts[:response_mode] == :stream do
+      opts[:client].request_stream(request)
+    else
+      opts[:client].request(request)
+    end
   end
 
   def response({:ok, resp}, conn, opts) do
     process_response(opts[:response_mode], conn, resp, opts)
   end
 
-  def response(error, conn, opts) do
+  def response({:error, error}, conn, opts) do
     do_error_callback(opts[:error_callback], error, conn)
   end
 
   defp do_error_callback({m, f, a}, error, conn) do
     cond do
-      :erlang.function_exported(m, f, length(a) + 2) ->
+      function_exported?(m, f, length(a) + 2) ->
         apply(m, f, a ++ [error, conn])
 
-      :erlang.function_exported(m, f, length(a) + 1) ->
+      function_exported?(m, f, length(a) + 1) ->
         apply(m, f, a ++ [error])
         default_error_resp(error, conn)
 
@@ -135,15 +135,13 @@ defmodule ReverseProxyPlug do
     end
   end
 
-  defp do_error_callback(fun, error, conn) when is_function(fun) do
-    case :erlang.fun_info(fun, :arity) do
-      {:arity, 2} ->
-        fun.(error, conn)
+  defp do_error_callback(fun, error, conn) when is_function(fun, 2) do
+    fun.(error, conn)
+  end
 
-      {:arity, 1} ->
-        fun.(error)
-        default_error_resp(error, conn)
-    end
+  defp do_error_callback(fun, error, conn) when is_function(fun, 1) do
+    fun.(error)
+    default_error_resp(error, conn)
   end
 
   defp do_error_callback(nil, error, conn), do: default_error_resp(error, conn)
@@ -154,7 +152,7 @@ defmodule ReverseProxyPlug do
     |> Conn.send_resp()
   end
 
-  defp status_from_error({:error, %HTTPClient.Error{id: nil, reason: reason}})
+  defp status_from_error(%HTTPClient.Error{id: nil, reason: reason})
        when reason in @timeout_error_reasons do
     :gateway_timeout
   end
@@ -176,65 +174,36 @@ defmodule ReverseProxyPlug do
          opts
        ) do
     headers
-    |> normalize_headers
+    |> opts[:normalize_headers].()
+    |> remove_hop_by_hop_headers
     |> add_resp_headers(conn, opts[:buffer_headers_mode])
     |> Conn.resp(status, body)
   end
 
-  if {:module, HTTPoison} == Code.ensure_loaded(HTTPoison) do
-    # This section of the code is present for retrocompatibility
-    # for the case where HTTPoison is the underlying HTTP Client
-    defp process_response(:stream, conn, _resp, opts),
-      do: stream_response(conn, opts)
+  defp process_response(:stream, initial_conn, resp, opts) do
+    resp
+    |> Enum.reduce_while(initial_conn, fn
+      {:status, status}, conn ->
+        case Map.fetch(opts[:status_callbacks], status) do
+          {:ok, handler} ->
+            {:halt, handler.(conn, opts)}
 
-    @spec stream_response(Conn.t(), Keyword.t()) :: Conn.t()
-    defp stream_response(conn, opts) do
-      receive do
-        %HTTPoison.AsyncStatus{code: code} ->
-          case opts[:status_callbacks][code] do
-            nil ->
-              conn
-              |> Conn.put_status(code)
-              |> stream_response(opts)
+          :error ->
+            {:cont, conn |> Conn.put_status(status)}
+        end
 
-            handler ->
-              handler.(conn, opts)
-          end
+      {:headers, headers}, conn ->
+        {:cont, conn |> send_stream_response_headers(headers, opts)}
 
-        %HTTPoison.AsyncHeaders{headers: headers} ->
-          additional_headers =
-            if conn.status >= 200 and conn.status != 204,
-              do: [{"transfer-encoding", "chunked"}],
-              else: []
+      {:chunk, chunk}, conn ->
+        case Conn.chunk(conn, chunk) do
+          {:ok, conn_after_chunk} -> {:cont, conn_after_chunk}
+          {:error, _error} -> {:halt, conn}
+        end
 
-          headers
-          |> normalize_headers
-          |> Enum.reject(fn {header, _} -> header == "content-length" end)
-          |> Enum.concat(additional_headers)
-          |> add_resp_headers(conn, opts[:stream_headers_mode])
-          |> Conn.send_chunked(conn.status)
-          |> stream_response(opts)
-
-        %HTTPoison.AsyncChunk{chunk: chunk} ->
-          case Conn.chunk(conn, chunk) do
-            {:ok, conn} ->
-              stream_response(conn, opts)
-
-            {:error, :closed} ->
-              conn
-          end
-
-        %HTTPoison.AsyncEnd{} ->
-          conn
-
-        %HTTPoison.Error{reason: reason} ->
-          do_error_callback(
-            opts[:error_callback],
-            {:error, %HTTPClient.Error{reason: reason}},
-            conn
-          )
-      end
-    end
+      {:error, error}, conn ->
+        {:halt, do_error_callback(opts[:error_callback], error, conn)}
+    end)
   end
 
   defp prepare_url(conn, overrides) do
@@ -263,7 +232,7 @@ defmodule ReverseProxyPlug do
     end
   end
 
-  defp prepare_request(conn, options) do
+  defp prepare_request(conn, options, body) do
     method =
       try do
         conn.method
@@ -280,7 +249,8 @@ defmodule ReverseProxyPlug do
 
     headers =
       conn.req_headers
-      |> normalize_headers
+      |> options[:normalize_headers].()
+      |> remove_hop_by_hop_headers
 
     proxy_req_host =
       if options[:preserve_host_header] do
@@ -291,34 +261,26 @@ defmodule ReverseProxyPlug do
 
     headers = List.keystore(headers, "host", 0, {"host", proxy_req_host})
 
-    client_options =
-      options[:response_mode]
-      |> get_client_opts(options[:client_options])
-      |> recycle_cookies(conn)
-
-    {method, url, headers, client_options}
+    %HTTPClient.Request{
+      method: method,
+      url: url,
+      body: body,
+      headers: headers,
+      options: options[:client_options],
+      cookies: get_cookies(conn)
+    }
   end
 
-  defp get_client_opts(:stream, opts) do
-    opts
-    |> Keyword.put_new(:timeout, :infinity)
-    |> Keyword.put_new(:recv_timeout, :infinity)
-    |> Keyword.put_new(:stream_to, self())
-  end
-
-  defp get_client_opts(:buffer, opts) do
-    opts
-    |> Keyword.put_new(:timeout, :infinity)
-    |> Keyword.put_new(:recv_timeout, :infinity)
-  end
-
-  defp normalize_headers(headers) do
+  defp send_stream_response_headers(%{status: status} = conn, headers, opts) do
     headers
-    |> downcase_headers
+    |> opts[:normalize_headers].()
     |> remove_hop_by_hop_headers
+    |> Enum.reject(fn {header, _} -> header == "content-length" end)
+    |> add_resp_headers(conn, opts[:stream_headers_mode])
+    |> Conn.send_chunked(status)
   end
 
-  defp downcase_headers(headers) do
+  def downcase_headers(headers) do
     headers
     |> Enum.map(fn {header, value} -> {String.downcase(header), value} end)
   end
@@ -335,14 +297,15 @@ defmodule ReverseProxyPlug do
       "upgrade"
     ]
 
+    # We downcase here, in case a custom :normalize_headers function does not downcase headers
     headers
-    |> Enum.reject(fn {header, _} -> Enum.member?(hop_by_hop_headers, header) end)
+    |> Enum.reject(fn {header, _} -> Enum.member?(hop_by_hop_headers, String.downcase(header)) end)
   end
 
   defp add_x_fwd_for_header(headers, conn) do
     {x_fwd_for, headers} = Enum.split_with(headers, fn {k, _v} -> k == "x-forwarded-for" end)
 
-    remote_ip = conn.remote_ip |> Tuple.to_list() |> Enum.join(".")
+    remote_ip = conn.remote_ip |> :inet.ntoa() |> to_string()
 
     x_forwarded_for =
       case x_fwd_for do
@@ -356,16 +319,6 @@ defmodule ReverseProxyPlug do
     headers ++ [{"x-forwarded-for", x_forwarded_for}]
   end
 
-  defp recycle_cookies(client_opts, conn) do
-    case get_cookies(conn) do
-      "" ->
-        client_opts
-
-      cookies when is_bitstring(cookies) ->
-        Keyword.put(client_opts, :hackney, cookie: cookies)
-    end
-  end
-
   defp get_cookies(%Conn{cookies: %Conn.Unfetched{aspect: :cookies}} = conn) do
     conn |> fetch_cookies() |> get_cookies()
   end
@@ -374,36 +327,25 @@ defmodule ReverseProxyPlug do
     cookies |> Enum.map_join("; ", fn {k, v} -> "#{k}=#{v}" end)
   end
 
-  def read_body(%{assigns: %{raw_body: raw_body}}), do: raw_body
+  def read_body(conn, opts \\ [])
 
-  def read_body(conn) do
-    case Conn.read_body(conn) do
-      {:ok, body, _conn} ->
-        body
+  def read_body(%{assigns: %{raw_body: raw_body}} = conn, _opts), do: {raw_body, conn}
 
-      {:more, body, conn} ->
-        {:stream,
-         Stream.resource(
-           fn -> {body, conn} end,
-           fn
-             {body, conn} ->
-               {[body], conn}
+  def read_body(conn, opts) do
+    Stream.unfold(Plug.Conn.read_body(conn, opts), fn
+      :done ->
+        nil
 
-             nil ->
-               {:halt, nil}
+      {:ok, body, new_conn} ->
+        {{new_conn, body}, :done}
 
-             conn ->
-               case Conn.read_body(conn) do
-                 {:ok, body, _conn} ->
-                   {[body], nil}
-
-                 {:more, body, conn} ->
-                   {[body], conn}
-               end
-           end,
-           fn _ -> nil end
-         )}
-    end
+      {:more, partial_body, new_conn} ->
+        {partial_body, Plug.Conn.read_body(new_conn, opts)}
+    end)
+    |> Enum.reduce({"", conn}, fn
+      {new_conn, body}, {body_acc, _conn_acc} -> {body_acc <> body, new_conn}
+      partial_body, {body_acc, conn_acc} -> {body_acc <> partial_body, conn_acc}
+    end)
   end
 
   defp host_header_from_url(url) when is_binary(url) do
@@ -431,18 +373,20 @@ defmodule ReverseProxyPlug do
   end
 
   defp ensure_http_client(opts) do
-    client = opts[:client] || Application.get_env(:reverse_proxy_plug, :http_client)
+    module =
+      opts[:client] || Application.get_env(:reverse_proxy_plug, :http_client) ||
+        HTTPClient.Adapters.HTTPoison
 
-    cond do
-      not is_nil(client) ->
-        Keyword.put(opts, :client, client)
+    Keyword.put(opts, :client, Code.ensure_loaded!(module))
+  end
 
-      Code.ensure_loaded?(HTTPClient.Adapters.HTTPoison) and is_nil(client) ->
-        Keyword.put(opts, :client, HTTPClient.Adapters.HTTPoison)
-
-      true ->
-        raise ArgumentError,
-              ":client option or :reverse_proxy_plug, :http_client global config must be set"
+  defp ensure_response_mode_compatibility(opts) do
+    if opts[:response_mode] == :stream and
+         not function_exported?(opts[:client], :request_stream, 1) do
+      raise ArgumentError,
+            "The client adapter does not support streaming responses. Please use :buffer response mode."
+    else
+      opts
     end
   end
 
@@ -452,7 +396,11 @@ defmodule ReverseProxyPlug do
 
   defp add_resp_headers(resp_headers, conn, :replace) do
     Enum.reduce(resp_headers, conn, fn {header, value}, conn ->
-      Conn.put_resp_header(conn, header, value)
+      Conn.put_resp_header(
+        conn,
+        header,
+        value
+      )
     end)
   end
 end
